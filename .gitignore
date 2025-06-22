@@ -1,0 +1,11 @@
+# Fichier .gitignore
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.flaskenv
+.DS_Store
+*.sqlite3
+*.log
