@@ -1,9 +1,11 @@
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse, parse_qs
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 import os
+import torch
+from langdetect import detect, LangDetectException
 
 try:
     from flask import current_app, has_app_context
@@ -12,6 +14,7 @@ except ImportError:
     def has_app_context():
         return False
 
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
 class ScrapingService:
     DEFAULT_TIMEOUT = 10
@@ -27,6 +30,39 @@ class ScrapingService:
         'health': ['santé', 'médecine', 'bien-être', 'virus', 'covid'],
     }
 
+    _summarizer_tokenizer = None
+    _summarizer_model = None
+
+    @classmethod
+    def _load_summarizer_model(cls):
+        if cls._summarizer_tokenizer is None or cls._summarizer_model is None:
+            model_name = "mrm8488/bert2bert_shared-french-summarization"
+            cls._summarizer_tokenizer = AutoTokenizer.from_pretrained(model_name)
+            cls._summarizer_model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+        return cls._summarizer_tokenizer, cls._summarizer_model
+
+    @classmethod
+    def enrich_with_ai_summary(cls, text, lang="fr"):
+        if not text or len(text.split()) < 5:
+            return "Résumé indisponible."
+        try:
+            tokenizer, model = cls._load_summarizer_model()
+            model.eval()
+            inputs = tokenizer([text], max_length=512, return_tensors="pt", truncation=True)
+            with torch.no_grad():
+                summary_ids = model.generate(
+                    inputs["input_ids"],
+                    num_beams=4,
+                    min_length=10,
+                    max_length=60,
+                    early_stopping=True
+                )
+            summary = tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+            return summary
+        except Exception as e:
+            cls._log_error("enrich_with_ai_summary", e)
+            return "Résumé indisponible."
+
     @classmethod
     def get_timeout(cls):
         try:
@@ -38,80 +74,99 @@ class ScrapingService:
 
     @classmethod
     def _log_error(cls, context, error):
+        msg = f"[{context}] Scraping error: {str(error)}"
         if has_app_context() and current_app:
             with current_app.app_context():
-                current_app.logger.error(f"[{context}] Scraping error: {str(error)}")
+                current_app.logger.error(msg)
         else:
-            print(f"[{context}] Scraping error: {str(error)}")
+            print(msg)
 
     @classmethod
-    def enrich_with_ai_summary(cls, text, lang="fr"):
-        if not text:
-            return ""
-        if len(text) > 120:
-            return text[:117] + "..."
-        return text
+    def detect_language(cls, text, default="fr"):
+        try:
+            lang = detect(text)
+            return lang if lang in ['fr', 'en', 'es', 'de', 'it'] else default
+        except LangDetectException:
+            return default
 
     @classmethod
     def detect_news_category(cls, query):
         query_lower = query.lower()
         for category, keywords in cls.NEWS_CATEGORIES.items():
-            for kw in keywords:
-                if kw in query_lower:
-                    return category
+            if any(kw in query_lower for kw in keywords):
+                return category
         return None
 
     @classmethod
     def reformulate_query(cls, query, lang="fr", debug=False):
+        q = query.lower()
+        # Reformulation : remplace les questions "c'est quoi", "qu'est-ce que" par "définition"
+        if re.search(r"c'est quoi|qu'est-ce que|qu est ce que|c est quoi", q):
+            q = re.sub(r"c'est quoi|qu'est-ce que|qu est ce que|c est quoi", 'définition', q)
         if debug:
-            print(f"[reformulate_query] Entrée: {query}")
-        return query.strip()
+            print(f"[reformulate_query] Reformulé en: {q.strip()}")
+        return q.strip()
 
     @classmethod
     def extract_keywords(cls, query):
+        # Stopwords limités pour ne pas enlever les mots interrogatifs importants
         stopwords = [
-            r"qu'est-ce que", r"qu'est ce que", r"c'est quoi", r"définition de",
-            r"définir", r"explique", r"expliquez", r"comment fonctionne", r"à quoi sert",
-            r"quelle est", r"qui est", r"où se trouve", r"où est", r"quand", r"comment", r"pourquoi"
+            r"qu'est-ce que", r"qu'est ce que", r"définition de",
+            r"définir", r"expliquez", r"comment fonctionne", r"à quoi sert",
         ]
-        q = query.strip()
-        lower_q = q.lower()
+        q = query.strip().lower()
         for word in stopwords:
-            pattern = re.compile(re.escape(word), re.IGNORECASE)
-            lower_q = pattern.sub(' ', lower_q)
-        cleaned = re.sub(r"[^\w\s\.-]", '', lower_q).strip()
-        cleaned = re.sub(r'\s+', ' ', cleaned)
-        return cleaned or query
+            q = re.sub(re.escape(word), '', q, flags=re.IGNORECASE)
+        cleaned = re.sub(r"[^\w\s\.-]", '', q).strip()
+        return re.sub(r'\s+', ' ', cleaned) or query
+
+    @classmethod
+    def detect_query_type(cls, query):
+        q = query.lower()
+        if any(x in q for x in ['qu’est-ce', 'qu est ce', 'définition', 'c’est quoi', 'c est quoi', 'définir', "c'est quoi", "c est quoi"]):
+            return 'definition'
+        elif any(x in q for x in ['actualités', 'news', 'breaking', 'infos', 'actualité']):
+            return 'news'
+        elif any(x in q for x in ['comment', 'pourquoi', 'fonctionne', 'utilise']):
+            return 'how'
+        elif any(x in q for x in ['qui', 'où', 'quand']):
+            return 'fact'
+        return 'general'
+
+    @classmethod
+    def _clean_google_url(cls, url):
+        parsed = urlparse(url)
+        if parsed.netloc.endswith('google.com'):
+            qs = parse_qs(parsed.query)
+            return qs.get('q', [url])[0]
+        return url
 
     @classmethod
     def _scrape_gnews(cls, query, limit, lang=None, debug=False, category=None):
         try:
-            api_key = current_app.config.get('GNEWS_API_KEY') if current_app else os.environ.get('GNEWS_API_KEY')
+            api_key = os.getenv("GNEWS_API_KEY") or (current_app.config.get("GNEWS_API_KEY") if current_app else None)
             if not api_key:
                 if debug:
                     print("[_scrape_gnews] Clé API GNews non définie")
                 return []
-
             q = quote_plus(query)
             url = f"https://gnews.io/api/v4/search?q={q}&lang={lang or 'fr'}&max={limit}&token={api_key}"
             if category:
                 url += f"&topic={category}"
-
-            headers = {'User-Agent': 'Mozilla/5.0'}
-            response = requests.get(url, headers=headers, timeout=cls.get_timeout())
+            response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=cls.get_timeout())
             if response.status_code != 200:
                 return []
-
-            data = response.json()
-            return [{
+            articles = response.json().get('articles', [])[:limit]
+            return [ {
                 'title': a.get('title'),
                 'url': a.get('url'),
                 'snippet': a.get('description') or a.get('content') or '',
                 'source': 'gnews',
                 'ai_summary': cls.enrich_with_ai_summary(a.get('description') or '', lang),
                 'enriched': True,
-                'image': a.get('image')
-            } for a in data.get('articles', [])][:limit]
+                'image': a.get('image'),
+                'language': lang
+            } for a in articles ]
         except Exception as e:
             cls._log_error("_scrape_gnews", e)
             return []
@@ -123,8 +178,7 @@ class ScrapingService:
             url = f"https://www.google.com/search?q={q}&num={limit}"
             if lang:
                 url += f"&hl={lang}"
-            headers = {'User-Agent': 'Mozilla/5.0'}
-            response = requests.get(url, headers=headers, timeout=cls.get_timeout())
+            response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=cls.get_timeout())
             soup = BeautifulSoup(response.text, 'html.parser')
             results = []
             for result in soup.select('div.g'):
@@ -135,14 +189,17 @@ class ScrapingService:
                     snippet = snippet_tag.get_text(strip=True) if snippet_tag else ''
                     results.append({
                         'title': title.get_text(strip=True),
-                        'url': link['href'],
+                        'url': cls._clean_google_url(link['href']),
                         'snippet': snippet,
                         'source': 'google',
                         'ai_summary': cls.enrich_with_ai_summary(snippet, lang),
                         'enriched': True,
-                        'image': None
+                        'image': None,
+                        'language': lang
                     })
-            return results[:limit]
+                    if len(results) >= limit:
+                        break
+            return results
         except Exception as e:
             cls._log_error("_scrape_google", e)
             return []
@@ -150,22 +207,20 @@ class ScrapingService:
     @classmethod
     def _scrape_duckduckgo(cls, query, limit, lang=None, debug=False):
         try:
-            q = quote_plus(query)
-            url = f"https://api.duckduckgo.com/?q={q}&format=json&no_html=1&skip_disambig=1"
-            response = requests.get(url, timeout=cls.get_timeout())
-            data = response.json()
-            results = []
+            url = f"https://api.duckduckgo.com/?q={quote_plus(query)}&format=json&no_html=1&skip_disambig=1"
+            data = requests.get(url, timeout=cls.get_timeout()).json()
             if data.get('AbstractText'):
-                results.append({
+                return [{
                     'title': data.get('Heading', query),
                     'url': data.get('AbstractURL'),
                     'snippet': data['AbstractText'],
                     'source': 'duckduckgo',
                     'ai_summary': cls.enrich_with_ai_summary(data['AbstractText'], lang),
                     'enriched': True,
-                    'image': None
-                })
-            return results[:limit]
+                    'image': None,
+                    'language': lang
+                }][:limit]
+            return []
         except Exception as e:
             cls._log_error("_scrape_duckduckgo", e)
             return []
@@ -173,28 +228,27 @@ class ScrapingService:
     @classmethod
     def _scrape_bing(cls, query, limit, lang=None, debug=False):
         try:
-            q = quote_plus(query)
-            url = f"https://www.bing.com/search?q={q}&count={limit}"
-            headers = {'User-Agent': 'Mozilla/5.0'}
-            response = requests.get(url, headers=headers, timeout=cls.get_timeout())
-            soup = BeautifulSoup(response.text, 'html.parser')
+            url = f"https://www.bing.com/search?q={quote_plus(query)}&count={limit}"
+            soup = BeautifulSoup(requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=cls.get_timeout()).text, 'html.parser')
             results = []
             for result in soup.find_all('li', class_='b_algo'):
                 title = result.find('h2')
                 link = result.find('a', href=True)
                 snippet = result.find('p')
                 if title and link:
-                    snippet_text = snippet.get_text(strip=True) if snippet else ''
                     results.append({
                         'title': title.get_text(strip=True),
                         'url': link['href'],
-                        'snippet': snippet_text,
+                        'snippet': snippet.get_text(strip=True) if snippet else '',
                         'source': 'bing',
-                        'ai_summary': cls.enrich_with_ai_summary(snippet_text, lang),
+                        'ai_summary': cls.enrich_with_ai_summary(snippet.get_text(strip=True) if snippet else '', lang),
                         'enriched': True,
-                        'image': None
+                        'image': None,
+                        'language': lang
                     })
-            return results[:limit]
+                    if len(results) >= limit:
+                        break
+            return results
         except Exception as e:
             cls._log_error("_scrape_bing", e)
             return []
@@ -203,10 +257,7 @@ class ScrapingService:
     def _scrape_wikipedia(cls, query, lang="fr", debug=False):
         try:
             url = f"https://{lang}.wikipedia.org/api/rest_v1/page/summary/{quote_plus(query)}"
-            response = requests.get(url, timeout=cls.get_timeout())
-            if response.status_code != 200:
-                return []
-            data = response.json()
+            data = requests.get(url, timeout=cls.get_timeout()).json()
             return [{
                 'title': data.get('title'),
                 'url': data.get('content_urls', {}).get('desktop', {}).get('page'),
@@ -214,69 +265,73 @@ class ScrapingService:
                 'source': 'wikipedia',
                 'ai_summary': cls.enrich_with_ai_summary(data.get('extract', ''), lang),
                 'enriched': True,
-                'image': data.get('thumbnail', {}).get('source')
+                'image': data.get('thumbnail', {}).get('source'),
+                'language': lang
             }]
         except Exception as e:
             cls._log_error("_scrape_wikipedia", e)
             return []
 
     @classmethod
-    def scrape_news(cls, query, limit=10, lang='fr', debug=False):
-        return cls._scrape_gnews(query, limit, lang=lang, debug=debug)
-
-    @classmethod
-    def scrape_web(cls, query, limit=10, lang='fr', debug=False):
+    def scrape_web(cls, query, limit=10, lang=None, debug=False):
         try:
+            lang = lang or cls.detect_language(query)
             rewritten = cls.reformulate_query(query, lang, debug)
-            cleaned_query = cls.extract_keywords(rewritten)
+
+            # IMPORTANT : on ne nettoie PAS la requête reformulée pour garder tous les mots utiles
+            cleaned_query = rewritten
+
             if debug:
-                print(f"🔍 Query nettoyée: '{cleaned_query}'")
+                print(f"🔍 Query utilisée pour scraping: '{cleaned_query}', langue: {lang}")
 
-            is_news_query = any(kw in cleaned_query.lower() for kw in [
-                "actualité", "nouvelles", "infos", "news", "breaking", "événements", "politique", "économie", "sport"
-            ])
+            query_type = cls.detect_query_type(query)
+            category = cls.detect_news_category(cleaned_query) if query_type == 'news' else None
 
-            category = cls.detect_news_category(cleaned_query) if is_news_query else None
-
-            def wikipedia_wrapper(q, l, ln, d):
-                return cls._scrape_wikipedia(q, lang=ln, debug=d)
-
-            sources = [
-                (lambda q, l, ln, d: cls._scrape_gnews(q, l, ln, d, category)) if is_news_query else None,
-                (cls._scrape_google, "google"),
-                (cls._scrape_duckduckgo, "duckduckgo"),
-                (cls._scrape_bing, "bing"),
-                (wikipedia_wrapper, "wikipedia")
-            ]
-
-            sources = [s for s in sources if s is not None]
+            if query_type == 'definition':
+                sources = [
+                    lambda q, l, ln, d: cls._scrape_wikipedia(q, lang=ln, debug=d),
+                    cls._scrape_google,
+                ]
+            elif query_type == 'news':
+                sources = [
+                    lambda q, l, ln, d: cls._scrape_gnews(q, l, ln, d, category),
+                    cls._scrape_google,
+                ]
+            else:
+                sources = [
+                    cls._scrape_google,
+                    cls._scrape_duckduckgo,
+                    cls._scrape_bing,
+                    lambda q, l, ln, d: cls._scrape_wikipedia(q, lang=ln, debug=d),
+                ]
 
             with ThreadPoolExecutor(max_workers=5) as executor:
                 futures = {
-                    executor.submit(func, cleaned_query, limit, lang, debug): name
-                    for func, name in sources if func is not None
+                    executor.submit(s, cleaned_query, limit, lang, debug): str(s)
+                    for s in sources
                 }
-
                 for future in as_completed(futures):
-                    try:
-                        res = future.result()
-                        if res:
-                            for result in res:
-                                result['language'] = lang
-                            return res[:limit]
-                    except Exception as e:
-                        cls._log_error(futures[future], e)
+                    res = future.result()
+                    if res:
+                        return res[:limit]
 
-            return [{
-                'title': f'Définition de {cleaned_query}',
-                'url': f'https://{lang}.wikipedia.org/wiki/{quote_plus(cleaned_query)}',
-                'snippet': f"{cleaned_query.capitalize()} est un concept dont la définition peut varier selon le contexte.",
-                'source': 'fallback',
-                'ai_summary': "Résumé IA non disponible.",
-                'enriched': True,
-                'language': lang,
-                'image': None
-            }]
         except Exception as e:
             cls._log_error("scrape_web", e)
-            return []
+
+        # Fallback IA local si rien trouvé
+        summary = cls.enrich_with_ai_summary(f"{query} est un sujet intéressant. Recherche plus approfondie en cours...", lang)
+        return [{
+            'title': f'Contenu généré pour {query}',
+            'url': None,
+            'snippet': summary,
+            'source': 'ia-local',
+            'ai_summary': summary,
+            'enriched': True,
+            'image': None,
+            'language': lang
+        }]
+
+    @classmethod
+    def scrape_news(cls, query, limit=10, lang='fr', debug=False):
+        category = cls.detect_news_category(query)
+        return cls._scrape_gnews(query, limit, lang=lang, debug=debug, category=category)

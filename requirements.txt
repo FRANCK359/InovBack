@@ -29,3 +29,4 @@ transformers==4.52.4
 grpcio-status==1.73.0
 protobuf==3.20.3
 grpcio==1.73.0
+setuptools<81
