@@ -26,7 +26,6 @@ pylint==2.17.4
 debugpy==1.6.7
 google-ai-generativelanguage==0.6.15
 transformers==4.52.4
-grpcio-status==1.73.0
-protobuf==3.20.3
+grpcio-status==1.71.0
 grpcio==1.73.0
 setuptools<81
